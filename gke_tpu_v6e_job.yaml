@@ -1,0 +1,91 @@
+# ==============================================================================
+# GKE Multi-Host 16-Chip (4x4) Indexed Job + Headless Service for LLNL ATS-6
+# ==============================================================================
+# Target GKE Cluster:   mb-tpu-benchmark
+# Target TPU Node Pool: mb-tpu-v6e-multi-16
+# Topology:             4x4 (16 TPU v6e chips across 4 ct6e-standard-4t hosts)
+# Execution Mode:       SINGLE UNIFIED 16-CHIP SPMD PROGRAM across all 4 pods
+#                       via Headless Service + `jax.distributed.initialize()`
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: ats6-tpu-svc
+spec:
+  clusterIP: None
+  selector:
+    app: llnl-ats6-tpuv6e-benchmark
+  ports:
+    - name: jax-coord
+      port: 8476
+      targetPort: 8476
+    - name: xprof
+      port: 9999
+      targetPort: 9999
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llnl-ats6-tpuv6e-benchmark
+spec:
+  parallelism: 4
+  completions: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: llnl-ats6-tpuv6e-benchmark
+    spec:
+      subdomain: ats6-tpu-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-16
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 4x4
+      containers:
+        - name: ats6-benchmark-runner
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+          ports:
+            - containerPort: 8476
+            - containerPort: 9999
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: JAX_COORDINATOR_ADDRESS
+              value: "llnl-ats6-tpuv6e-benchmark-0.ats6-tpu-svc:8476"
+            - name: JAX_NUM_PROCESSES
+              value: "4"
+          resources:
+            limits:
+              google.com/tpu: 4
+            requests:
+              google.com/tpu: 4
+          volumeMounts:
+            - name: benchmark-code
+              mountPath: /workspace/ats6
+            - name: xprof-output
+              mountPath: /tmp/ats6_xprof_traces
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              export JAX_PROCESS_ID="${JOB_COMPLETION_INDEX}"
+              cd /workspace/ats6
+              echo "=== [Worker ${JAX_PROCESS_ID}/4] Joining 16-Chip (4x4) Unified TPU v6e Cluster ==="
+              python3 -u ats6_pallas_benchmarks.py --suite=all --xprof_dir=/tmp/ats6_xprof_traces
+              if [ -f /tmp/ats6_xprof_traces/ats6_xprof_summary.md ]; then
+                echo ""
+                echo "=== BEGIN_ATS6_XPROF_SUMMARY_MD ==="
+                cat /tmp/ats6_xprof_traces/ats6_xprof_summary.md
+                echo "=== END_ATS6_XPROF_SUMMARY_MD ==="
+                echo "=== BEGIN_ATS6_XPROF_SUMMARY_JSON ==="
+                cat /tmp/ats6_xprof_traces/ats6_xprof_summary.json
+                echo "=== END_ATS6_XPROF_SUMMARY_JSON ==="
+              fi
+      volumes:
+        - name: benchmark-code
+          configMap:
+            name: ats6-tpuv6e-code
+        - name: xprof-output
+          emptyDir: {}
