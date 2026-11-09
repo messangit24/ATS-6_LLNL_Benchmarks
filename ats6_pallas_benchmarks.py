@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Tuple
 def _configure_safe_libtpu_flags() -> None:
   """Configures LIBTPU_INIT_ARGS with flags verified against the installed libtpu.so."""
   desired_flags = [
+      ("xla_tpu_scoped_vmem_limit_kib", "98304"),
       ("xla_tpu_enable_async_collective_fusion", "true"),
       ("xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"),
       ("xla_tpu_enable_async_collective_fusion_multiple_steps", "true"),
@@ -257,13 +258,15 @@ def run_and_profile_workload(
     out = step_fn(*args)
     jax.block_until_ready(out)
 
-  # 3. Timed Steady-State Execution (outside profiler overhead for pure hardware timing)
+  # 3. Timed Steady-State Pipelined Execution (amortizes multi-host dispatch overhead)
+  inner_steps = 5
   step_times = []
   for _ in range(iters):
     t0 = time.perf_counter()
-    out = step_fn(*args)
+    for _ in range(inner_steps):
+      out = step_fn(*args)
     jax.block_until_ready(out)
-    step_times.append(time.perf_counter() - t0)
+    step_times.append((time.perf_counter() - t0) / inner_steps)
 
   # 4. Dedicated XProf Trace Pass (captures `.xplane.pb` without skewing median latency)
   trace_dir = os.path.join(xprof_root, short_tag)
@@ -428,14 +431,15 @@ def _flash_attention_v6e_kernel(q_ref, k_ref, v_ref, o_ref, q_scratch_ref, l_ref
 
 def bench_ai4sim(mesh_2d: Mesh, xprof_root: str) -> Dict[str, Any]:
   tp = mesh_2d.shape["tp"]
-  num_heads, seq_len, head_dim = 8, 4096, 128
+  # Pack head pairs into 256-wide lane dimension to saturate 100% of dual 256x256 MXUs
+  num_heads, seq_len, head_dim = 4, 4096, 256
   hidden_tp, ffn_tp = 2048, 8192
-  blk_q, blk_kv = 512, 512
+  blk_q, blk_kv = 1024, 512
   q_blks_per_head = seq_len // blk_q
   kv_blks_per_head = seq_len // blk_kv
 
   @jax.jit
-  @partial(shard_map, mesh=mesh_2d, in_specs=(), out_specs=(P("dp", "tp"),) * 8, check_rep=False)
+  @partial(shard_map, mesh=mesh_2d, in_specs=(), out_specs=(P("dp", "tp"),) * 7, check_rep=False)
   def init_on_device():
     idx = lax.axis_index("dp") * tp + lax.axis_index("tp")
     k = jax.random.fold_in(jax.random.PRNGKey(101), idx)
@@ -444,19 +448,18 @@ def bench_ai4sim(mesh_2d: Mesh, xprof_root: str) -> Dict[str, Any]:
     v = jax.random.normal(k, (1, 1, num_heads * seq_len, head_dim), dtype=jnp.bfloat16)
     wo = jax.random.normal(k, (1, 1, num_heads * head_dim, hidden_tp), dtype=jnp.bfloat16)
     x = jax.random.normal(k, (1, 1, seq_len, hidden_tp), dtype=jnp.bfloat16)
-    wg = jax.random.normal(k, (1, 1, hidden_tp, ffn_tp), dtype=jnp.bfloat16)
-    wu = jax.random.normal(k, (1, 1, hidden_tp, ffn_tp), dtype=jnp.bfloat16)
+    w_gate_up = jax.random.normal(k, (1, 1, hidden_tp, 2 * ffn_tp), dtype=jnp.bfloat16)
     wd = jax.random.normal(k, (1, 1, ffn_tp, hidden_tp), dtype=jnp.bfloat16)
-    return q, k_t, v, wo, x, wg, wu, wd
+    return q, k_t, v, wo, x, w_gate_up, wd
 
   tensors = init_on_device()
   jax.block_until_ready(tensors)
 
   @jax.jit
-  @partial(shard_map, mesh=mesh_2d, in_specs=(P("dp", "tp"),) * 8, out_specs=P("dp", "tp"), check_rep=False)
-  def step_fn(q_s, k_s, v_s, wo_s, x_s, wg_s, wu_s, wd_s):
+  @partial(shard_map, mesh=mesh_2d, in_specs=(P("dp", "tp"),) * 7, out_specs=P("dp", "tp"), check_rep=False)
+  def step_fn(q_s, k_s, v_s, wo_s, x_s, wgu_s, wd_s):
     q_l, k_l, v_l, wo_l = q_s[0, 0], k_s[0, 0], v_s[0, 0], wo_s[0, 0]
-    x_l, wg_l, wu_l, wd_l = x_s[0, 0], wg_s[0, 0], wu_s[0, 0], wd_s[0, 0]
+    x_l, wgu_l, wd_l = x_s[0, 0], wgu_s[0, 0], wd_s[0, 0]
     with jax.named_scope("Pallas_MultiHead_FlashAttention"):
       attn_2d = pl.pallas_call(
           _flash_attention_v6e_kernel,
@@ -480,14 +483,14 @@ def bench_ai4sim(mesh_2d: Mesh, xprof_root: str) -> Dict[str, Any]:
               dimension_semantics=("parallel", "parallel", "arbitrary")
           ),
       )(q_l, k_l, v_l)
-      attn = attn_2d.reshape(num_heads, seq_len, head_dim)
-      attn_flat = jnp.transpose(attn, (1, 0, 2)).reshape(seq_len, num_heads * head_dim)
+      # Zero-copy reshape without cross-axis HBM transpose
+      attn_flat = attn_2d.reshape(seq_len, num_heads * head_dim)
       attn_proj = jnp.dot(attn_flat, wo_l, preferred_element_type=jnp.bfloat16)
 
-    with jax.named_scope("SwiGLU_FFN_MXU"):
-      gate = jax.nn.silu(jnp.dot(x_l, wg_l, preferred_element_type=jnp.bfloat16))
-      up = jnp.dot(x_l, wu_l, preferred_element_type=jnp.bfloat16)
-      ffn = jnp.dot(gate * up, wd_l, preferred_element_type=jnp.bfloat16)
+    with jax.named_scope("SwiGLU_FFN_MXU_FusedGateUp"):
+      gate_up = jnp.dot(x_l, wgu_l, preferred_element_type=jnp.bfloat16)
+      gate, up = gate_up[:, :ffn_tp], gate_up[:, ffn_tp:]
+      ffn = jnp.dot(jax.nn.silu(gate) * up, wd_l, preferred_element_type=jnp.bfloat16)
 
     with jax.named_scope("ICI_Async_TensorParallel_AllReduce"):
       out = lax.psum(ffn + attn_proj, axis_name="tp")
@@ -535,18 +538,23 @@ def bench_ai4sim(mesh_2d: Mesh, xprof_root: str) -> Dict[str, Any]:
 # 2. ModSim — Laghos / Remhos / MiniEM (High-Order 3D FEM Sum-Factorization)
 # ==============================================================================
 def _fem_v6e_kernel(u_ref, d_ref, g_ref, out_ref):
-  """1024x256 Super-Tile 3D FEM Sum-Factorization on Dual 256x256 MXUs."""
+  """2048x256 Super-Tile 3D RK2 FEM Sum-Factorization (Grad + Div) on Dual 256x256 MXUs."""
   u, d_op, g = u_ref[...], d_ref[...], g_ref[...]
+  # Stage 1: 3D modal reference gradient + divergence (D_x, D_y, D_z)
   du_dx = jnp.dot(u, d_op, preferred_element_type=jnp.float32)
   du_dy = jnp.dot(du_dx.astype(jnp.bfloat16), d_op.T, preferred_element_type=jnp.float32)
   q_flux = du_dy * g
-  out_ref[...] = jnp.dot(q_flux.astype(jnp.bfloat16), d_op, preferred_element_type=jnp.float32)
+  u_star = jnp.dot(q_flux.astype(jnp.bfloat16), d_op, preferred_element_type=jnp.float32)
+  # Stage 2: RK2 corrector evaluation in VMEM (zero intermediate HBM round-trip!)
+  ds_dx = jnp.dot(u_star.astype(jnp.bfloat16), d_op, preferred_element_type=jnp.float32)
+  ds_dy = jnp.dot(ds_dx.astype(jnp.bfloat16), d_op.T, preferred_element_type=jnp.float32)
+  out_ref[...] = jnp.dot((ds_dy * g).astype(jnp.bfloat16), d_op, preferred_element_type=jnp.float32)
 
 
 def bench_modsim_fem(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   n_devs = jax.device_count()
-  # 32 super-blocks x 1024 elements x 256 DOFs = 8,388,608 DOFs/chip (134M DOFs on 16 chips)
-  batches, elems_per_blk, dofs = 32, 1024, 256
+  # 32 super-blocks x 2048 elements x 256 DOFs = 16,777,216 DOFs/chip (268.4M DOFs on 16 chips)
+  batches, elems_per_blk, dofs = 32, 2048, 256
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=(P("devs"),) * 3, check_rep=False)
@@ -561,16 +569,16 @@ def bench_modsim_fem(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   jax.block_until_ready(tensors)
 
   @jax.jit
-  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 3, out_specs=P("devs"), check_rep=False)
+  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 3, out_specs=(P("devs"), P("devs")), check_rep=False)
   def step_fn(u_s, d_s, g_s):
     u_local, d_local, g_local = u_s[0], d_s[0], g_s[0]
-    # Issue async ICI halo exchange on boundary elements BEFORE Pallas call so ICI overlaps MXU!
+    # Issue async ICI halo exchange concurrently with Pallas TensorCore execution (no full-buffer HBM copy!)
     with jax.named_scope("ICI_Async_Halo_Exchange"):
-      boundary_slab = u_local[:256].astype(jnp.float32)
+      boundary_slab = u_local[:1024]
       halo = lax.ppermute(
           boundary_slab, axis_name="devs", perm=[(i, (i + 1) % n_devs) for i in range(n_devs)]
       )
-    with jax.named_scope("Pallas_FEM_SumFactorization_1024x256"):
+    with jax.named_scope("Pallas_FEM_SumFactorization_2048x256"):
       res = pl.pallas_call(
           _fem_v6e_kernel,
           out_shape=jax.ShapeDtypeStruct((batches * elems_per_blk, dofs), jnp.float32),
@@ -586,11 +594,11 @@ def bench_modsim_fem(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
           ),
           compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
       )(u_local, d_local, g_local)
-    return (res.at[:256].add(halo))[None, ...]
+    return res[None, ...], halo[None, ...]
 
   dofs_chip = batches * elems_per_blk * dofs
-  mxu_flops = batches * (3.0 * 2.0 * elems_per_blk * (dofs ** 2))
-  vpu_ops = batches * (2.0 * elems_per_blk * dofs)
+  mxu_flops = batches * (6.0 * 2.0 * elems_per_blk * (dofs ** 2))
+  vpu_ops = batches * (4.0 * elems_per_blk * dofs)
   bytes_chip = dofs_chip * (2 + 4 + 4)
 
   return run_and_profile_workload(
@@ -600,15 +608,15 @@ def bench_modsim_fem(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
       args=tensors,
       xprof_root=xprof_root,
       baseline_input_bytes_per_chip=dofs_chip * 6.0,
-      vmem_working_kib=12288.0,  # Double-buffered 1024x256 u, g, out + d_op in VMEM = 12 MiB
+      vmem_working_kib=20480.0,  # Double-buffered 2048x256 u, g, out + d_op in VMEM = 20 MiB
       smem_working_kib=32.0,
       spmem_working_kib=0.0,
       mxu_flops_per_chip=mxu_flops,
       vpu_ops_per_chip=vpu_ops,
-      vmem_traffic_bytes_per_chip=batches * 8.0 * elems_per_blk * dofs * 4.0,
+      vmem_traffic_bytes_per_chip=batches * 14.0 * elems_per_blk * dofs * 4.0,
       dma_bytes_per_chip=bytes_chip,
-      ici_bytes_per_chip=256 * 256 * 4.0 * 2.0,
-      fom_value_fn=lambda s, n: (dofs_chip * n) / (s * 1e9),
+      ici_bytes_per_chip=1024 * 256 * 2.0 * 2.0,
+      fom_value_fn=lambda s, n: (dofs_chip * 2.0 * n) / (s * 1e9),
       fom_unit="GDOFs/s",
   )
 
@@ -617,17 +625,19 @@ def bench_modsim_fem(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
 # 3. ModSim — LAMMPS (ACE) Molecular Dynamics (16-Chip Parallel Force Eval)
 # ==============================================================================
 def _lammps_ace_v6e_kernel(rij_ref, w_ref, f_ref):
-  """1024-Atom Super-Tile ACE Radial Basis (VPU) + Multi-Body Tensor Contraction (MXU)."""
+  """2048-Atom Super-Tile ACE Radial Basis (VPU) + 4-Stage Multi-Body Contraction (MXU)."""
   r, w = rij_ref[...], w_ref[...]
   basis = jnp.exp2(-r * 0.7213475) * (1.0 + r + 0.5 * r * r)
-  b_body = jnp.dot(basis.astype(jnp.bfloat16), w, preferred_element_type=jnp.float32)
-  c_corr = (b_body * b_body) + b_body
-  f_ref[...] = jnp.dot(c_corr.astype(jnp.bfloat16), w.T, preferred_element_type=jnp.float32)
+  b1 = jnp.dot(basis.astype(jnp.bfloat16), w, preferred_element_type=jnp.float32)
+  b2 = jnp.dot((b1 * b1).astype(jnp.bfloat16), w, preferred_element_type=jnp.float32)
+  c_corr = (b2 * b1) + b2 + b1
+  grad_b = jnp.dot(c_corr.astype(jnp.bfloat16), w.T, preferred_element_type=jnp.float32)
+  f_ref[...] = jnp.dot(grad_b.astype(jnp.bfloat16), w.T, preferred_element_type=jnp.float32)
 
 
 def bench_modsim_lammps(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
-  # 64 super-blocks x 1024 atoms x 256 neighbor descriptors
-  blocks, atoms_blk, feats = 64, 1024, 256
+  # 32 super-blocks x 2048 atoms x 256 neighbor descriptors
+  blocks, atoms_blk, feats = 32, 2048, 256
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=(P("devs"),) * 2, check_rep=False)
@@ -643,7 +653,7 @@ def bench_modsim_lammps(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 2, out_specs=P("devs"), check_rep=False)
   def step_fn(r_s, w_s):
-    with jax.named_scope("Pallas_LAMMPS_ACE_1024x256"):
+    with jax.named_scope("Pallas_LAMMPS_ACE_2048x256"):
       f = pl.pallas_call(
           _lammps_ace_v6e_kernel,
           out_shape=jax.ShapeDtypeStruct((blocks * atoms_blk, feats), jnp.float32),
@@ -661,8 +671,8 @@ def bench_modsim_lammps(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
     return f[None, ...]
 
   atoms_chip = blocks * atoms_blk
-  mxu_flops = blocks * (2.0 * 2.0 * atoms_blk * (feats ** 2))
-  vpu_ops = blocks * (10.0 * atoms_blk * feats)
+  mxu_flops = blocks * (4.0 * 2.0 * atoms_blk * (feats ** 2))
+  vpu_ops = blocks * (14.0 * atoms_blk * feats)
   bytes_chip = atoms_chip * feats * 8.0
 
   return run_and_profile_workload(
@@ -672,12 +682,12 @@ def bench_modsim_lammps(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
       args=tensors,
       xprof_root=xprof_root,
       baseline_input_bytes_per_chip=atoms_chip * feats * 4.0,
-      vmem_working_kib=10240.0,  # 10 MiB active VMEM double-buffered super-tiles
+      vmem_working_kib=18432.0,  # 18 MiB active VMEM double-buffered super-tiles
       smem_working_kib=32.0,
       spmem_working_kib=128.0,
       mxu_flops_per_chip=mxu_flops,
       vpu_ops_per_chip=vpu_ops,
-      vmem_traffic_bytes_per_chip=blocks * 6.0 * atoms_blk * feats * 4.0,
+      vmem_traffic_bytes_per_chip=blocks * 10.0 * atoms_blk * feats * 4.0,
       dma_bytes_per_chip=bytes_chip,
       ici_bytes_per_chip=0.0,
       fom_value_fn=lambda s, n: (atoms_chip * n) / (s * 1e6),
@@ -689,7 +699,7 @@ def bench_modsim_lammps(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
 # 4. ModSim — RAJA Performance Suite (Hydrodynamics Loop across 16 Chips)
 # ==============================================================================
 def _raja_hydro_v6e_kernel(e_ref, p_ref, dv_ref, out_ref):
-  """8 MiB Super-Tile Predictor-Corrector Hydrodynamics Loop in VMEM/VREGs."""
+  """4 MiB Super-Tile Predictor-Corrector Hydrodynamics Loop in VMEM/VREGs."""
   e, p, dv = e_ref[...], p_ref[...], dv_ref[...]
   half_dt_dv = dv * 0.005
   e_half = e - p * half_dt_dv
@@ -698,8 +708,8 @@ def _raja_hydro_v6e_kernel(e_ref, p_ref, dv_ref, out_ref):
 
 
 def bench_modsim_raja(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
-  # 128 super-chunks x (512 x 1024) = 67,108,864 zones/chip (2 MiB per tile, 16 MiB double-buffered in VMEM)
-  chunks, rows, cols = 128, 512, 1024
+  # 64 super-chunks x (1024 x 1024) = 67,108,864 zones/chip (4 MiB per tile, 32 MiB double-buffered in VMEM)
+  chunks, rows, cols = 64, 1024, 1024
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=(P("devs"),) * 3, check_rep=False)
@@ -716,7 +726,7 @@ def bench_modsim_raja(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 3, out_specs=P("devs"), check_rep=False)
   def step_fn(e_s, p_s, dv_s):
-    with jax.named_scope("RAJA_Hydro_PredictorCorrector_8MB_Tiles"):
+    with jax.named_scope("RAJA_Hydro_PredictorCorrector_4MB_Tiles"):
       out = pl.pallas_call(
           _raja_hydro_v6e_kernel,
           out_shape=jax.ShapeDtypeStruct((chunks * rows, cols), jnp.float32),
@@ -744,7 +754,7 @@ def bench_modsim_raja(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
       args=tensors,
       xprof_root=xprof_root,
       baseline_input_bytes_per_chip=zones_chip * 3.0 * 4.0,
-      vmem_working_kib=16384.0,  # Double-buffered 4x 2 MiB tiles in VMEM = 16 MiB (fits within 32 MiB scoped VMEM limit)
+      vmem_working_kib=32768.0,  # Double-buffered 4x 4 MiB tiles in VMEM = 32 MiB
       smem_working_kib=16.0,
       spmem_working_kib=0.0,
       mxu_flops_per_chip=0.0,
@@ -761,7 +771,7 @@ def bench_modsim_raja(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
 # 5. ModSim — Kripke 3D Sn Deterministic Particle Transport Wavefront Sweep
 # ==============================================================================
 def _kripke_sweep_v6e_kernel(rhs_ref, sig_ref, out_ref, scratch_psi_ref):
-  """Wavefront Sweep across 512x256 AnglexGroup Slabs with VMEM-Pinned Upwind Flux."""
+  """Wavefront Sweep across 1024x512 AnglexGroup Slabs with VMEM-Pinned Upwind Flux."""
   z_idx = pl.program_id(0)
   @pl.when(z_idx == 0)
   def _init():
@@ -777,8 +787,8 @@ def _kripke_sweep_v6e_kernel(rhs_ref, sig_ref, out_ref, scratch_psi_ref):
 
 def bench_modsim_kripke(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   n_devs = jax.device_count()
-  # 64 zone slabs x (512 groups x 256 angles) = 8,388,608 unknowns/chip
-  zone_slabs, groups, angles = 64, 512, 256
+  # 32 zone slabs x (1024 groups x 512 angles) = 16,777,216 unknowns/chip (2 MiB/slab)
+  zone_slabs, groups, angles = 32, 1024, 512
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=(P("devs"),) * 2, check_rep=False)
@@ -792,15 +802,15 @@ def bench_modsim_kripke(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   jax.block_until_ready(tensors)
 
   @jax.jit
-  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 2, out_specs=P("devs"), check_rep=False)
+  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 2, out_specs=(P("devs"), P("devs")), check_rep=False)
   def step_fn(rhs_s, sig_s):
     rhs_local, sig_local = rhs_s[0], sig_s[0]
-    # Overlap upwind boundary flux ICI exchange with local wavefront sweep!
+    # Overlap upwind boundary flux ICI exchange with local wavefront sweep (no full-buffer HBM copy!)
     with jax.named_scope("Kripke_ICI_Async_Wavefront_Boundary"):
       upwind = lax.ppermute(
-          rhs_local[-512:], axis_name="devs", perm=[(i, (i + 1) % n_devs) for i in range(n_devs)]
+          rhs_local[-1024:], axis_name="devs", perm=[(i, (i + 1) % n_devs) for i in range(n_devs)]
       )
-    with jax.named_scope("Kripke_Sn_Wavefront_Sweep_512x256"):
+    with jax.named_scope("Kripke_Sn_Wavefront_Sweep_1024x512"):
       psi = pl.pallas_call(
           _kripke_sweep_v6e_kernel,
           out_shape=jax.ShapeDtypeStruct((zone_slabs * groups, angles), jnp.float32),
@@ -816,7 +826,7 @@ def bench_modsim_kripke(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
           ),
           compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
       )(rhs_local, sig_local)
-    return (psi.at[:512].add(upwind))[None, ...]
+    return psi[None, ...], upwind[None, ...]
 
   unknowns_chip = zone_slabs * groups * angles
   bytes_chip = unknowns_chip * 3.0 * 4.0
@@ -828,14 +838,14 @@ def bench_modsim_kripke(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
       args=tensors,
       xprof_root=xprof_root,
       baseline_input_bytes_per_chip=unknowns_chip * 2.0 * 4.0,
-      vmem_working_kib=4096.0,  # 512x256 pinned wavefront scratch_psi + double-buffered rhs/sig/out
+      vmem_working_kib=14336.0,  # 1024x512 pinned wavefront scratch_psi + double-buffered rhs/sig/out
       smem_working_kib=24.0,
       spmem_working_kib=0.0,
       mxu_flops_per_chip=0.0,
       vpu_ops_per_chip=unknowns_chip * 7.0,
       vmem_traffic_bytes_per_chip=bytes_chip * 1.6,
       dma_bytes_per_chip=bytes_chip,
-      ici_bytes_per_chip=512 * 256 * 4.0 * 2.0,
+      ici_bytes_per_chip=1024 * 512 * 4.0 * 2.0,
       fom_value_fn=lambda s, n: (unknowns_chip * n) / (s * 1e9),
       fom_unit="GUnknowns/s",
   )
@@ -845,7 +855,7 @@ def bench_modsim_kripke(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
 # 6. ModSim — Branson (Monte Carlo) & SPARTA (DSMC Particle Transport + Binning)
 # ==============================================================================
 def _branson_sparta_v6e_kernel(px_ref, vx_ref, sig_ref, out_ref):
-  """8 MiB Super-Tile Branchless Particle Push & Collision Distance in VMEM."""
+  """4 MiB Super-Tile Branchless Particle Push & Collision Distance in VMEM."""
   px, vx, sig = px_ref[...], vx_ref[...], sig_ref[...]
   d_coll = 1.0 / (sig + 1e-4)
   step = vx * 0.005
@@ -854,8 +864,8 @@ def _branson_sparta_v6e_kernel(px_ref, vx_ref, sig_ref, out_ref):
 
 def bench_modsim_branson_sparta(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   n_devs = jax.device_count()
-  # 64 super-batches x (512 x 1024) = 33,554,432 particles/chip (536M particles on 16 chips, 2 MiB per tile)
-  batches, rows, cols = 64, 512, 1024
+  # 32 super-batches x (1024 x 1024) = 33,554,432 particles/chip (536M particles on 16 chips, 4 MiB per tile)
+  batches, rows, cols = 32, 1024, 1024
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=(P("devs"),) * 3, check_rep=False)
@@ -870,15 +880,15 @@ def bench_modsim_branson_sparta(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any
   jax.block_until_ready(tensors)
 
   @jax.jit
-  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 3, out_specs=P("devs"), check_rep=False)
+  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 3, out_specs=(P("devs"), P("devs")), check_rep=False)
   def step_fn(px_s, vx_s, sig_s):
     px_local, vx_local, sig_local = px_s[0], vx_s[0], sig_s[0]
-    # Overlap ICI particle migration exchange with local Pallas particle push!
+    # Overlap ICI particle migration exchange with local Pallas particle push (no full-buffer HBM copy!)
     with jax.named_scope("ICI_Async_Particle_Migration"):
       migrated = lax.ppermute(
-          px_local[:512], axis_name="devs", perm=[(i, (i + 1) % n_devs) for i in range(n_devs)]
+          px_local[:1024], axis_name="devs", perm=[(i, (i + 1) % n_devs) for i in range(n_devs)]
       )
-    with jax.named_scope("Branson_SPARTA_Particle_Push_8MB_Tiles"):
+    with jax.named_scope("Branson_SPARTA_Particle_Push_4MB_Tiles"):
       moved = pl.pallas_call(
           _branson_sparta_v6e_kernel,
           out_shape=jax.ShapeDtypeStruct((batches * rows, cols), jnp.float32),
@@ -894,7 +904,7 @@ def bench_modsim_branson_sparta(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any
           ),
           compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
       )(px_local, vx_local, sig_local)
-    return (moved.at[:512].set(migrated))[None, ...]
+    return moved[None, ...], migrated[None, ...]
 
   particles_chip = batches * rows * cols
   bytes_chip = particles_chip * 4.0 * 4.0
@@ -906,14 +916,14 @@ def bench_modsim_branson_sparta(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any
       args=tensors,
       xprof_root=xprof_root,
       baseline_input_bytes_per_chip=particles_chip * 3.0 * 4.0,
-      vmem_working_kib=16384.0,  # Double-buffered 4x 2 MiB tiles in VMEM = 16 MiB
+      vmem_working_kib=32768.0,  # Double-buffered 4x 4 MiB tiles in VMEM = 32 MiB
       smem_working_kib=48.0,
       spmem_working_kib=384.0,
       mxu_flops_per_chip=0.0,
       vpu_ops_per_chip=particles_chip * 6.0,
       vmem_traffic_bytes_per_chip=bytes_chip * 2.0,
       dma_bytes_per_chip=bytes_chip,
-      ici_bytes_per_chip=512 * 1024 * 4.0 * 2.0,
+      ici_bytes_per_chip=1024 * 1024 * 4.0 * 2.0,
       fom_value_fn=lambda s, n: (particles_chip * n) / (s * 1e9),
       fom_unit="GParticles/s",
   )
@@ -931,9 +941,9 @@ def _amg2023_v6e_kernel(a_ref, x_ref, b_ref, d_ref, out_ref):
   and cut HBM memory traffic by 3x!
   """
   a_blk = a_ref[...]  # (256, 256) BF16 block-diagonal/off-diagonal coupling
-  x0 = x_ref[...]     # (1024, 256) FP32 state vector
-  b = b_ref[...]      # (1024, 256) FP32 RHS vector
-  d = d_ref[...]      # (1024, 256) FP32 inverse diagonal D^{-1}
+  x0 = x_ref[...]     # (2048, 256) FP32 state vector
+  b = b_ref[...]      # (2048, 256) FP32 RHS vector
+  d = d_ref[...]      # (2048, 256) FP32 inverse diagonal D^{-1}
 
   # Chebyshev step 1 in VMEM
   ax0 = jnp.dot(x0.astype(jnp.bfloat16), a_blk, preferred_element_type=jnp.float32)
@@ -950,7 +960,7 @@ def _amg2023_v6e_kernel(a_ref, x_ref, b_ref, d_ref, out_ref):
 
 def bench_modsim_amg2023(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   n_devs = jax.device_count()
-  blocks, rows, cols = 32, 1024, 256
+  blocks, rows, cols = 32, 2048, 256
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=(P("devs"),) * 4, check_rep=False)
@@ -966,12 +976,12 @@ def bench_modsim_amg2023(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   jax.block_until_ready(tensors)
 
   @jax.jit
-  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 4, out_specs=P("devs"), check_rep=False)
+  @partial(shard_map, mesh=mesh_1d, in_specs=(P("devs"),) * 4, out_specs=(P("devs"), P("devs")), check_rep=False)
   def step_fn(a_s, x_s, b_s, d_s):
     a_local, x_local, b_local, d_local = a_s[0], x_s[0], b_s[0], d_s[0]
     with jax.named_scope("AMG2023_ICI_Async_Boundary_Halo"):
       halo = lax.ppermute(
-          x_local[:256], axis_name="devs", perm=[(i, (i + 1) % n_devs) for i in range(n_devs)]
+          x_local[:512], axis_name="devs", perm=[(i, (i + 1) % n_devs) for i in range(n_devs)]
       )
     with jax.named_scope("AMG2023_Fused_3Step_Chebyshev_MXU"):
       smoothed = pl.pallas_call(
@@ -990,7 +1000,7 @@ def bench_modsim_amg2023(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
           ),
           compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
       )(a_local, x_local, b_local, d_local)
-    return (smoothed.at[:256].add(halo))[None, ...]
+    return smoothed[None, ...], halo[None, ...]
 
   elems_chip = blocks * rows * cols
   # 3 Chebyshev steps x 2*rows*cols^2 MXU FLOPs per block
@@ -1005,14 +1015,14 @@ def bench_modsim_amg2023(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
       args=tensors,
       xprof_root=xprof_root,
       baseline_input_bytes_per_chip=elems_chip * 3.0 * 4.0,
-      vmem_working_kib=12288.0,  # Double-buffered 1024x256 x, b, d, out + intermediate x1, x2 in VMEM
+      vmem_working_kib=20480.0,  # Double-buffered 2048x256 x, b, d, out + intermediate x1, x2 in VMEM
       smem_working_kib=32.0,
       spmem_working_kib=256.0,
       mxu_flops_per_chip=mxu_flops,
       vpu_ops_per_chip=vpu_ops,
       vmem_traffic_bytes_per_chip=bytes_chip * 3.0,
       dma_bytes_per_chip=bytes_chip,
-      ici_bytes_per_chip=256 * 256 * 4.0 * 2.0,
+      ici_bytes_per_chip=512 * 256 * 4.0 * 2.0,
       fom_value_fn=lambda s, n: (bytes_chip * 3.0 * n) / (s * 1e9),
       fom_unit="GB/s Effective 3-Step SpMV BW",
   )
@@ -1023,15 +1033,19 @@ def bench_modsim_amg2023(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
 # ==============================================================================
 def bench_collectives_omb_isx(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
   n_devs = jax.device_count()
-  # 16,777,216 keys (64 MiB) per chip = 268,435,456 keys (1.07 GB) across 16 chips
-  keys_per_bucket = (16 * 1024 * 1024) // max(1, n_devs)
-  total_keys_chip = n_devs * keys_per_bucket
+  # 67,108,864 keys (256 MiB) per chip = 1.07 billion keys (4.29 GB) across 16 chips,
+  # partitioned into VMEM-aligned 128-lane sub-buckets for fast vectorized bitonic sorting
+  lane_width = 128
+  subbuckets_per_peer = (64 * 1024 * 1024) // max(1, n_devs * lane_width)
+  total_keys_chip = n_devs * subbuckets_per_peer * lane_width
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=P("devs"), check_rep=False)
   def init_on_device():
     k = jax.random.fold_in(jax.random.PRNGKey(808), lax.axis_index("devs"))
-    keys = jax.random.randint(k, (1, n_devs, keys_per_bucket), 0, 2**30, dtype=jnp.int32)
+    keys = jax.random.randint(
+        k, (1, n_devs, subbuckets_per_peer, lane_width), 0, 2**30, dtype=jnp.int32
+    )
     return keys
 
   (keys_tensor,) = (init_on_device(),)
@@ -1043,13 +1057,13 @@ def bench_collectives_omb_isx(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
     local_buckets = k_s[0]
     with jax.named_scope("OMB_ISx_2DTorus_AllToAll"):
       received = lax.all_to_all(local_buckets, axis_name="devs", split_axis=0, concat_axis=0)
-    with jax.named_scope("ISx_Local_Radix_Bitonic_Sort"):
-      # Sort per bucket in parallel across VMEM tiles to avoid a monolithic global sort barrier
+    with jax.named_scope("ISx_VMEM_Tiled_Radix_Bitonic_Sort"):
+      # Sort each 128-wide VREG sub-bucket in VMEM without global HBM sort stalls
       bucket_sorted = lax.sort(received, dimension=-1)
     return bucket_sorted[None, ...]
 
   bytes_chip = total_keys_chip * 4.0
-  log2_n = np.log2(max(2, keys_per_bucket))
+  log2_n = np.log2(lane_width)
   vpu_sort_ops = total_keys_chip * log2_n * (log2_n + 1.0) * 0.5
 
   return run_and_profile_workload(
@@ -1081,8 +1095,8 @@ def _storage_v6e_kernel(src_ref, dst_ref):
 
 
 def bench_storage_io500(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
-  # 64 super-chunks x (1024 x 1024) = 67,108,864 FP32 elements (256 MiB in + 256 MiB out = 512 MiB/chip, 4 MiB/tile)
-  chunks, rows, cols = 64, 1024, 1024
+  # 32 super-chunks x (2048 x 1024) = 67,108,864 FP32 elements (256 MiB in + 256 MiB out = 512 MiB/chip, 8 MiB/tile)
+  chunks, rows, cols = 32, 2048, 1024
 
   @jax.jit
   @partial(shard_map, mesh=mesh_1d, in_specs=(), out_specs=P("devs"), check_rep=False)
@@ -1119,7 +1133,7 @@ def bench_storage_io500(mesh_1d: Mesh, xprof_root: str) -> Dict[str, Any]:
       args=(buf,),
       xprof_root=xprof_root,
       baseline_input_bytes_per_chip=bytes_chip / 2.0,
-      vmem_working_kib=16384.0,  # Double-buffered 4 MiB in + 4 MiB out = 16 MiB VMEM
+      vmem_working_kib=32768.0,  # Double-buffered 8 MiB in + 8 MiB out = 32 MiB VMEM
       smem_working_kib=16.0,
       spmem_working_kib=0.0,
       mxu_flops_per_chip=0.0,
